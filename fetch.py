@@ -2,13 +2,15 @@
 """Weather DB fetcher (Python stdlib only).
 
 Usage:
+  python fetch.py all                                   # every current source, all locations
   python fetch.py forecast --location worthington-mn [--source open-meteo|nws|all]
   python fetch.py alerts   --location worthington-mn
+  python fetch.py spc      [--day 1|2]                  # SPC outlook text + per-location risk
   python fetch.py locations
 
 All logic lives here; the future website only reads data/weather.db.
 """
-import argparse, datetime as dt, gzip, hashlib, json, random, sqlite3, sys, time
+import argparse, datetime as dt, gzip, hashlib, json, random, re, sqlite3, sys, time
 import urllib.error, urllib.parse, urllib.request
 
 from init_db import DB_PATH, init_db
@@ -22,6 +24,14 @@ OPEN_METEO_FORECAST = "https://api.open-meteo.com/v1/forecast"
 OM_HOURLY = ["temperature_2m", "precipitation_probability", "precipitation",
              "wind_speed_10m", "wind_direction_10m", "wind_gusts_10m"]
 NWS_BASE = "https://api.weather.gov"
+SPC_TEXT = "https://www.spc.noaa.gov/products/outlook/day{day}otlk.txt"
+SPC_CAT_GEOJSON = "https://www.spc.noaa.gov/products/outlook/day{day}otlk_cat.nolyr.geojson"
+SPC_DN = {"TSTM": 2, "MRGL": 3, "SLGT": 4, "ENH": 5, "MDT": 6, "HIGH": 7}
+# Headline phrases in the SPC text, highest first.
+SPC_TEXT_RISK = [("HIGH RISK", "HIGH"), ("MODERATE RISK", "MDT"), ("ENHANCED RISK", "ENH"),
+                 ("SLIGHT RISK", "SLGT"), ("MARGINAL RISK", "MRGL")]
+TZ_OFFSETS = {"UTC": 0, "GMT": 0, "EST": -5, "EDT": -4, "CST": -6, "CDT": -5,
+              "MST": -7, "MDT": -6, "PST": -8, "PDT": -7}
 
 COMPASS = {d: i * 22.5 for i, d in enumerate(
     "N NNE NE ENE E ESE SE SSE S SSW SW WSW W WNW NW NNW".split())}
@@ -48,6 +58,7 @@ class Fetcher:
         self.run_id = cur.lastrowid
         con.commit()
         self.requests = self.failed = self.inserted = self.updated = 0
+        self.warnings = []   # degraded-but-not-failed sources (e.g. SPC layer unreachable -> text only)
 
     # ---- HTTP -----------------------------------------------------------
     def get(self, url, source, endpoint, location_id=None, accept="application/json"):
@@ -80,7 +91,7 @@ class Fetcher:
             raw_id = self._store_raw(source, endpoint, url, location_id, status, ctype, body)
             if status != 200:
                 self.failed += 1
-                raise RuntimeError(f"HTTP {status} for {url}: {body[:300]!r}")
+                raise RuntimeError(f"HTTP {status} for {url.split('?')[0]}: {body[:120]!r}")
             return body, raw_id
 
     def _store_raw(self, source, endpoint, url, location_id, status, ctype, body):
@@ -90,6 +101,7 @@ class Fetcher:
                VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
             (self.run_id, location_id, source, endpoint, url, utcnow(), status, ctype,
              hashlib.sha256(body).hexdigest(), len(body), gzip.compress(body)))
+        self.con.commit()   # keep provenance even if the job later fails
         return cur.lastrowid
 
     def finish(self, status, error=None):
@@ -179,6 +191,78 @@ class Fetcher:
             n += 1
         return n
 
+    # ---- SPC convective outlooks --------------------------------------
+    def spc_outlook(self, day, locations):
+        """Store the Day N outlook text, then the per-location categorical risk from the GeoJSON layer.
+        Returns a short summary string. The text is required; the layer is best-effort."""
+        url = SPC_TEXT.format(day=day)
+        body, raw_id = self.get(url, "spc", f"outlook_day{day}_text", accept="text/plain")
+        text = body.decode("utf-8", "replace").replace("\r\n", "\n")
+        issued, wmo, vfrom, vto = parse_spc_text_times(text)
+        if not issued:
+            raise RuntimeError(f"could not parse issued time from Day {day} text")
+        max_risk = parse_spc_text_risk(text)
+        now = utcnow()
+        existed = self.con.execute("SELECT id FROM spc_outlooks WHERE day=? AND issued=?", (day, issued)).fetchone()
+        self.con.execute(
+            """INSERT INTO spc_outlooks(day, issued, product_url, text, max_risk, valid_from, valid_to,
+               wmo_header, fetched_at, raw_response_id) VALUES (?,?,?,?,?,?,?,?,?,?)
+               ON CONFLICT(day, issued) DO UPDATE SET fetched_at=excluded.fetched_at, text=excluded.text,
+               raw_response_id=excluded.raw_response_id,
+               max_risk=CASE WHEN spc_outlooks.layer_status='ok' THEN spc_outlooks.max_risk
+                             ELSE excluded.max_risk END""",
+            (day, issued, url, text, max_risk, vfrom, vto, wmo, now, raw_id))
+        outlook_id = self.con.execute("SELECT id FROM spc_outlooks WHERE day=? AND issued=?",
+                                      (day, issued)).fetchone()[0]
+        if existed:
+            self.updated += 1
+        else:
+            self.inserted += 1
+        self.con.commit()
+
+        # Categorical layer -> point-in-polygon per location
+        lurl = SPC_CAT_GEOJSON.format(day=day)
+        layer_issued, status, risks = None, "ok", {}
+        try:
+            gbody, _ = self.get(lurl, "spc", f"outlook_day{day}_cat_geojson", accept="application/geo+json")
+            feats = json.loads(gbody).get("features", [])
+            for f in feats:
+                layer_issued = layer_issued or to_utc(f["properties"]["ISSUE_ISO"])
+            if layer_issued and layer_issued != issued:
+                status = f"mismatch: layer issued {layer_issued}, text issued {issued}"
+            else:
+                for loc in locations:
+                    risks[loc["id"]] = point_risk(loc["longitude"], loc["latitude"], feats)
+                # The layer is authoritative for the national max category (text headline is the fallback).
+                labels = [f["properties"].get("LABEL") for f in feats if f["properties"].get("LABEL") in SPC_DN]
+                layer_max = max(labels, key=SPC_DN.get) if labels else "NONE"
+                self.con.execute("UPDATE spc_outlooks SET max_risk=? WHERE id=?", (layer_max, outlook_id))
+                max_risk = layer_max
+        except Exception as e:
+            status = f"unreachable: {e}"[:300]
+        if status != "ok":
+            self.warnings.append(f"spc day {day} layer {status}"[:200])
+        # Never downgrade an outlook whose layer was already checked OK (its risk rows stay valid).
+        self.con.execute("""UPDATE spc_outlooks SET layer_url=?, layer_issued=?, layer_status=?
+                            WHERE id=? AND (? = 'ok' OR layer_status IS NULL OR layer_status != 'ok')""",
+                         (lurl, layer_issued, status, outlook_id, status))
+        for loc_id, (label, dn) in risks.items():
+            seen = self.con.execute("SELECT 1 FROM spc_location_risk WHERE outlook_id=? AND location_id=?",
+                                    (outlook_id, loc_id)).fetchone()
+            self.con.execute(
+                """INSERT INTO spc_location_risk(outlook_id, location_id, risk, risk_dn, checked_at)
+                   VALUES (?,?,?,?,?) ON CONFLICT(outlook_id, location_id) DO UPDATE SET
+                   risk=excluded.risk, risk_dn=excluded.risk_dn, checked_at=excluded.checked_at""",
+                (outlook_id, loc_id, label, dn, now))
+            if seen:
+                self.updated += 1
+            else:
+                self.inserted += 1
+        self.con.commit()
+        by_slug = {l["id"]: l["slug"] for l in locations}
+        detail = ", ".join(f"{by_slug[k]}={v[0]}" for k, v in risks.items()) or "no point check"
+        return f"issued {issued}, max {max_risk}, layer {status}; {detail}"
+
     def _insert_forecast(self, rows):
         before = self.con.total_changes
         self.con.executemany(
@@ -189,6 +273,81 @@ class Fetcher:
         self.inserted += n
         self.con.commit()
         return n
+
+
+def parse_spc_text_times(text):
+    """Return (issued_utc, wmo_header, valid_from_utc, valid_to_utc) from an SPC outlook text product."""
+    wmo = re.search(r"^(ACUS0\d KWNS (\d{2})(\d{2})(\d{2}))", text, re.M)
+    local = re.search(r"^(\d{3,4}) (AM|PM) ([A-Z]{3}) \w{3} (\w{3}) (\d{1,2}) (\d{4})", text, re.M)
+    issued = None
+    if local and local.group(3) in TZ_OFFSETS:
+        hhmm = local.group(1).zfill(4)
+        h, m = int(hhmm[:2]) % 12 + (12 if local.group(2) == "PM" else 0), int(hhmm[2:])
+        t = dt.datetime.strptime(f"{local.group(4)} {local.group(5)} {local.group(6)}", "%b %d %Y")
+        t = t.replace(hour=h, minute=m, tzinfo=dt.timezone(dt.timedelta(hours=TZ_OFFSETS[local.group(3)])))
+        issued = to_utc(t.isoformat())
+    base = dt.datetime.fromisoformat(issued.replace("Z", "+00:00")) if issued else None
+    vfrom = vto = None
+    v = re.search(r"^Valid (\d{2})(\d{2})(\d{2})Z - (\d{2})(\d{2})(\d{2})Z", text, re.M)
+    if v and base:
+        def ddhhmm(d, h, m):  # resolve day-of-month relative to the issue time (handles month rollover)
+            t = base.replace(day=1, hour=int(h), minute=int(m), second=0)
+            for months_ahead in (0, 1, -1):
+                y, mo = t.year, t.month + months_ahead
+                y, mo = y + (mo - 1) // 12, (mo - 1) % 12 + 1
+                try:
+                    c = t.replace(year=y, month=mo, day=int(d))
+                except ValueError:
+                    continue
+                if abs((c - base).days) <= 5:
+                    return to_utc(c.isoformat())
+            return None
+        vfrom, vto = ddhhmm(*v.group(1, 2, 3)), ddhhmm(*v.group(4, 5, 6))
+    return issued, (wmo.group(1) if wmo else None), vfrom, vto
+
+
+def parse_spc_text_risk(text):
+    """Highest categorical risk named in the outlook headline(s); TSTM/NONE if no severe area."""
+    head = text.split("...SUMMARY...")[0].upper().replace("\n", " ")
+    for phrase, label in SPC_TEXT_RISK:
+        if phrase in head:
+            return label
+    # No severe category in the headline: the text alone can't tell TSTM from NONE.
+    return None
+
+
+def point_in_ring(x, y, ring):
+    """Ray casting: is (x, y) inside the closed ring [[x, y], ...]?"""
+    inside, n = False, len(ring)
+    j = n - 1
+    for i in range(n):
+        xi, yi = ring[i][0], ring[i][1]
+        xj, yj = ring[j][0], ring[j][1]
+        if (yi > y) != (yj > y) and x < (xj - xi) * (y - yi) / (yj - yi) + xi:
+            inside = not inside
+        j = i
+    return inside
+
+
+def point_in_geometry(x, y, geom):
+    polys = [geom["coordinates"]] if geom["type"] == "Polygon" else \
+        geom["coordinates"] if geom["type"] == "MultiPolygon" else []
+    for rings in polys:
+        if rings and point_in_ring(x, y, rings[0]) and not any(point_in_ring(x, y, h) for h in rings[1:]):
+            return True
+    return False
+
+
+def point_risk(lon, lat, features):
+    """Highest SPC categorical label whose polygon contains the point, else ('NONE', 0)."""
+    best = ("NONE", 0)
+    for f in features:
+        p, g = f.get("properties", {}), f.get("geometry")
+        label = p.get("LABEL")
+        dn = p.get("DN") or SPC_DN.get(label, 0)
+        if g and label in SPC_DN and dn > best[1] and point_in_geometry(lon, lat, g):
+            best = (label, dn)
+    return best
 
 
 def load_location(con, slug):
@@ -208,6 +367,9 @@ def main():
     f.add_argument("--source", choices=["open-meteo", "nws", "all"], default="all")
     a = sub.add_parser("alerts", help="NWS active alerts for a location")
     a.add_argument("--location", required=True)
+    sp = sub.add_parser("spc", help="SPC convective outlooks + per-location risk")
+    sp.add_argument("--day", type=int, choices=[1, 2], action="append")
+    sub.add_parser("all", help="every current source for every location")
     sub.add_parser("locations", help="list configured locations")
     ap.add_argument("--db", default=str(DB_PATH))
     args = ap.parse_args()
@@ -219,28 +381,42 @@ def main():
             print(*r, sep="\t")
         return
 
-    loc = load_location(con, args.location)
+    con.row_factory = sqlite3.Row
+    all_locs = [dict(r) for r in con.execute("SELECT * FROM locations ORDER BY id")]
     fx = Fetcher(con, args.command, {k: v for k, v in vars(args).items() if k != "db"})
+    jobs = []   # (label, callable) - each job succeeds or fails on its own
+    if args.command in ("forecast", "alerts"):
+        locs = [load_location(con, args.location)]
+    elif args.command == "all":
+        locs = all_locs
+    else:
+        locs = []
+    for loc in locs:
+        src = getattr(args, "source", "all")
+        if args.command in ("forecast", "all") and src in ("open-meteo", "all"):
+            jobs.append((f"{loc['slug']}: open-meteo forecast", lambda l=loc: fx.open_meteo_forecast(l)))
+        if args.command in ("forecast", "all") and src in ("nws", "all"):
+            jobs.append((f"{loc['slug']}: nws hourly forecast", lambda l=loc: fx.nws_hourly(l)))
+        if args.command in ("alerts", "all"):
+            jobs.append((f"{loc['slug']}: nws alerts", lambda l=loc: fx.nws_alerts(l)))
+    if args.command in ("spc", "all"):
+        for day in (getattr(args, "day", None) or [1, 2]):
+            jobs.append((f"spc day {day}", lambda d=day: fx.spc_outlook(d, all_locs)))
     errors, done = [], []
-    jobs = []
-    if args.command == "forecast":
-        if args.source in ("open-meteo", "all"):
-            jobs.append(("open-meteo forecast", fx.open_meteo_forecast))
-        if args.source in ("nws", "all"):
-            jobs.append(("nws hourly forecast", fx.nws_hourly))
-    elif args.command == "alerts":
-        jobs.append(("nws alerts", fx.nws_alerts))
     for label, fn in jobs:
         try:
-            n = fn(loc)
+            n = fn()
             done.append(label)
-            print(f"{loc['slug']}: {label}: {n} rows")
+            print(f"{label}: {n}" + (" rows" if isinstance(n, int) else ""))
         except Exception as e:  # keep going; record the failure on the run
             con.rollback()
             errors.append(f"{label}: {e}")
-            print(f"{loc['slug']}: {label} FAILED: {e}", file=sys.stderr)
-    status = "ok" if not errors else ("partial" if done else "error")
-    fx.finish(status, "; ".join(errors) or None)
+            print(f"{label} FAILED: {e}", file=sys.stderr)
+    if errors:
+        status = "partial" if done else "error"
+    else:
+        status = "partial" if fx.warnings else "ok"
+    fx.finish(status, "; ".join(errors + fx.warnings) or None)
     print(f"fetch_run {fx.run_id}: {status} ({fx.requests} requests, {fx.inserted} inserted, {fx.updated} updated)")
     sys.exit(0 if status == "ok" else 1)
 

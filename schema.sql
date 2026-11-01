@@ -130,17 +130,29 @@ CREATE TABLE IF NOT EXISTS spc_outlooks (
     issued          TEXT NOT NULL,                 -- issuance time as parsed from the product (UTC)
     product_url     TEXT,
     text            TEXT NOT NULL,
-    max_risk        TEXT,                          -- TSTM|MRGL|SLGT|ENH|MDT|HIGH if parseable
-    fetched_at      TEXT NOT NULL,
+    max_risk        TEXT,                          -- highest category named in the text headline:
+                                                   -- TSTM|MRGL|SLGT|ENH|MDT|HIGH, or NONE
+    valid_from      TEXT,                          -- UTC, from the "Valid DDHHMMZ - DDHHMMZ" line
+    valid_to        TEXT,
+    wmo_header      TEXT,                          -- e.g. "ACUS01 KWNS 011954"
+    layer_url       TEXT,                          -- categorical GeoJSON used for the point check
+    layer_issued    TEXT,                          -- ISSUE_ISO from the GeoJSON (UTC)
+    layer_status    TEXT,                          -- ok | unreachable: <reason> | mismatch: <reason>
+    fetched_at      TEXT NOT NULL,                 -- last time this issuance was seen
     raw_response_id INTEGER REFERENCES raw_responses(id),
     UNIQUE (day, issued)
 );
 
--- Per-location risk category from the SPC outlook (filled later, from GeoJSON/point check).
+-- Per-location categorical risk for an outlook, from a stdlib point-in-polygon
+-- (ray casting, holes respected) against SPC's categorical GeoJSON layer.
+-- risk = highest containing category (TSTM|MRGL|SLGT|ENH|MDT|HIGH) or NONE.
+-- No row is written when the layer was unreachable (text-only outlook).
 CREATE TABLE IF NOT EXISTS spc_location_risk (
     outlook_id      INTEGER NOT NULL REFERENCES spc_outlooks(id),
     location_id     INTEGER NOT NULL REFERENCES locations(id),
-    risk            TEXT,
+    risk            TEXT NOT NULL,
+    risk_dn         INTEGER,                       -- SPC DN code (2=TSTM ... 8=HIGH), 0 for NONE
+    checked_at      TEXT NOT NULL,
     PRIMARY KEY (outlook_id, location_id)
 );
 
@@ -157,7 +169,7 @@ CREATE TABLE IF NOT EXISTS backfill_progress (
 );
 
 CREATE TABLE IF NOT EXISTS schema_meta (key TEXT PRIMARY KEY, value TEXT);
-INSERT OR REPLACE INTO schema_meta(key, value) VALUES ('schema_version', '1');
+INSERT OR REPLACE INTO schema_meta(key, value) VALUES ('schema_version', '2');
 
 -- Seed locations (US Census Bureau 2024 Gazetteer place internal points).
 INSERT OR IGNORE INTO locations (slug, name, state, latitude, longitude, timezone, coord_source) VALUES

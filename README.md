@@ -28,7 +28,10 @@ Gazetteer.
   alerts for that point. It requires a User-Agent with contact info, which
   this script sends.
 - **Storm Prediction Center**: the Day 1 and Day 2 convective outlook text
-  products.
+  products (`day{1,2}otlk.txt`), plus the categorical GeoJSON layers
+  (`day{1,2}otlk_cat.nolyr.geojson`). Each location's risk category is worked
+  out with a standard-library ray-casting point-in-polygon check that
+  respects holes.
 
 The fetcher is polite with every source. It waits 1.5 s between requests,
 then retries up to 5 times with exponential backoff (2, 4, 8, 16, 32 s plus
@@ -39,11 +42,41 @@ jitter) on HTTP 429, any 5xx, or a network error, and it honours
 
 ```bash
 python init_db.py                                  # create/upgrade data/weather.db (idempotent)
+python fetch.py all                                # EVERY current source, all 3 locations (~13-15 requests, ~20 s)
 python fetch.py locations                          # list locations
 python fetch.py forecast --location worthington-mn # Open-Meteo + NWS hourly forecast
 python fetch.py forecast --location worthington-mn --source open-meteo
 python fetch.py alerts   --location worthington-mn # NWS active alerts
+python fetch.py spc [--day 1] [--day 2]            # SPC outlook text + per-location risk
 ```
+
+`fetch.py all` runs these jobs in order:
+
+1. For each location:
+   - the Open-Meteo forecast
+   - the NWS hourly forecast (the `/points` grid lookup is cached on
+     `locations` and refreshed every 30 days)
+   - NWS active alerts for the point
+2. SPC Day 1 and Day 2.
+
+Each job succeeds or fails on its own. A failure is recorded in
+`fetch_runs.error` and marks the run `partial`, but the remaining jobs still
+run. If an SPC categorical layer can't be reached, or its issue time doesn't
+match the text, the outlook text is still stored. That outlook's
+`layer_status` records the reason, no per-location risk rows are written for
+it, and the run is marked `partial`. The script exits 0 only when the run
+status is `ok`.
+
+**SPC risk logic:**
+- **Per location:** `spc_location_risk.risk` is the highest category whose
+  polygon contains the point (TSTM < MRGL < SLGT < ENH < MDT < HIGH), or
+  `NONE`.
+- **National:** `spc_outlooks.max_risk` is the highest category in the layer.
+  When the layer is unavailable, it falls back to the text headline ("...THERE
+  IS A SLIGHT RISK..."), which can't tell TSTM from NONE, so it's left NULL in
+  that case.
+- **Re-fetching:** fetching the same issuance again updates `fetched_at`. It
+  never downgrades an outlook whose layer already checked OK.
 
 Every run adds a row to `fetch_runs`, and every HTTP response is saved
 gzip-compressed, along with its SHA-256, in `raw_responses`.
@@ -59,14 +92,16 @@ gzip-compressed, along with its SHA-256, in `raw_responses`.
 | `forecast_latest` (view) | only the newest snapshot per location and source |
 | `observations_hourly` | historical hourly data, upserted, unique on (location, time) |
 | `nws_alerts` | NWS alerts, upserted on the NWS alert id, with first_seen and last_seen |
-| `spc_outlooks` | SPC Day 1/2 outlook text: issued time, text, max risk (TSTM/MRGL/SLGT/ENH/MDT/HIGH) when it can be parsed |
-| `spc_location_risk` | per-location SPC risk for an outlook |
+| `spc_outlooks` | SPC Day 1/2 outlooks, unique on (day, issued): issued time (UTC), valid from and to, WMO header, full text, max risk, layer URL, layer issue time, layer status |
+| `spc_location_risk` | per-location categorical risk for an outlook, with the SPC DN code and check time |
 | `backfill_progress` | per location: the newest and oldest dates fetched so far for the backward walk, the target date (1940-01-01), chunk size, and whether it's done |
 
 **Forecast uniqueness policy: snapshots.** `forecast_hourly` is unique on
 `(location, source, valid_time, fetched_at)`. Each fetch keeps its own rows,
 which shows how a forecast changes over time. Query `forecast_latest` when
-you only want the current forecast.
+you only want the current forecast. Each `all` run adds about 1,620 forecast
+rows, roughly 350 KB. That's fine for a few runs a day, but a retention or
+pruning step will be needed before frequent scheduling.
 
 Units: °C, mm, km/h, degrees, and %. Times are stored in UTC ISO-8601 with a
 trailing `Z`. In NWS rows, `precip_mm` and `wind_gust_kmh` are NULL because
@@ -78,8 +113,9 @@ kept.
 
 1. ✅ **Scaffold**: the schema, and the fetcher for the Open-Meteo and NWS
    hourly forecast for Worthington.
-2. **All three locations**: one `fetch.py all` call pulls everything for
-   every location (forecasts, NWS alerts, SPC Day 1/2).
+2. ✅ **All three locations**: one `fetch.py all` call pulls everything for
+   every location (forecasts, NWS alerts, SPC Day 1/2 text plus a risk
+   check for each point).
 3. **Historical backfill**: start at today and walk backward in small chunks
    (for example 30 days per location per run), pacing the requests and
    recording progress in `backfill_progress`. There is no single giant
