@@ -1,0 +1,1 @@
+# Weather DB uses only the Python standard library (3.9+). Nothing to install.

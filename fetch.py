@@ -1,0 +1,249 @@
+#!/usr/bin/env python3
+"""Weather DB fetcher (Python stdlib only).
+
+Usage:
+  python fetch.py forecast --location worthington-mn [--source open-meteo|nws|all]
+  python fetch.py alerts   --location worthington-mn
+  python fetch.py locations
+
+All logic lives here; the future website only reads data/weather.db.
+"""
+import argparse, datetime as dt, gzip, hashlib, json, random, sqlite3, sys, time
+import urllib.error, urllib.parse, urllib.request
+
+from init_db import DB_PATH, init_db
+
+USER_AGENT = "WeatherDB/0.1 (https://github.com/BigWaveDan/weather-db; onehumancompany@proton.me)"
+POLITE_SLEEP_S = 1.5          # pause between every request
+MAX_RETRIES = 5               # on 429 / 5xx / network errors
+BACKOFF_BASE_S = 2.0          # 2, 4, 8, 16, 32 s (+ jitter); honours Retry-After
+
+OPEN_METEO_FORECAST = "https://api.open-meteo.com/v1/forecast"
+OM_HOURLY = ["temperature_2m", "precipitation_probability", "precipitation",
+             "wind_speed_10m", "wind_direction_10m", "wind_gusts_10m"]
+NWS_BASE = "https://api.weather.gov"
+
+COMPASS = {d: i * 22.5 for i, d in enumerate(
+    "N NNE NE ENE E ESE SE SSE S SSW SW WSW W WNW NW NNW".split())}
+
+
+def utcnow():
+    return dt.datetime.now(dt.timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def to_utc(ts):
+    """Normalize an ISO timestamp (with offset, or naive=UTC) to 'YYYY-MM-DDTHH:MM:SSZ'."""
+    t = dt.datetime.fromisoformat(ts.replace("Z", "+00:00"))
+    if t.tzinfo is None:
+        t = t.replace(tzinfo=dt.timezone.utc)
+    return t.astimezone(dt.timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+class Fetcher:
+    def __init__(self, con, command, args):
+        self.con = con
+        self._last_request = 0.0
+        cur = con.execute("INSERT INTO fetch_runs(command, args, started_at) VALUES (?,?,?)",
+                          (command, json.dumps(args), utcnow()))
+        self.run_id = cur.lastrowid
+        con.commit()
+        self.requests = self.failed = self.inserted = self.updated = 0
+
+    # ---- HTTP -----------------------------------------------------------
+    def get(self, url, source, endpoint, location_id=None, accept="application/json"):
+        """GET with polite pacing and retry/backoff. Stores every final response in raw_responses."""
+        for attempt in range(MAX_RETRIES + 1):
+            wait = POLITE_SLEEP_S - (time.monotonic() - self._last_request)
+            if wait > 0:
+                time.sleep(wait)
+            self._last_request = time.monotonic()
+            self.requests += 1
+            req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT, "Accept": accept})
+            status, body, ctype, retry_after = None, b"", None, None
+            try:
+                with urllib.request.urlopen(req, timeout=30) as r:
+                    status, body, ctype = r.status, r.read(), r.headers.get("Content-Type")
+            except urllib.error.HTTPError as e:
+                status, body, ctype = e.code, e.read() or b"", e.headers.get("Content-Type")
+                retry_after = e.headers.get("Retry-After")
+            except (urllib.error.URLError, TimeoutError, ConnectionError) as e:
+                body = str(e).encode()
+            retryable = status is None or status == 429 or status >= 500
+            if retryable and attempt < MAX_RETRIES:
+                self.failed += 1
+                delay = BACKOFF_BASE_S * (2 ** attempt) + random.uniform(0, 1)
+                if retry_after and retry_after.isdigit():
+                    delay = max(delay, int(retry_after))
+                print(f"  {status or 'network error'} from {url} - retry {attempt+1} in {delay:.1f}s", file=sys.stderr)
+                time.sleep(delay)
+                continue
+            raw_id = self._store_raw(source, endpoint, url, location_id, status, ctype, body)
+            if status != 200:
+                self.failed += 1
+                raise RuntimeError(f"HTTP {status} for {url}: {body[:300]!r}")
+            return body, raw_id
+
+    def _store_raw(self, source, endpoint, url, location_id, status, ctype, body):
+        cur = self.con.execute(
+            """INSERT INTO raw_responses(fetch_run_id, location_id, source, endpoint, url, fetched_at,
+               http_status, content_type, body_sha256, body_bytes, body_gzip)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+            (self.run_id, location_id, source, endpoint, url, utcnow(), status, ctype,
+             hashlib.sha256(body).hexdigest(), len(body), gzip.compress(body)))
+        return cur.lastrowid
+
+    def finish(self, status, error=None):
+        self.con.execute(
+            """UPDATE fetch_runs SET finished_at=?, status=?, requests_made=?, requests_failed=?,
+               rows_inserted=?, rows_updated=?, error=? WHERE id=?""",
+            (utcnow(), status, self.requests, self.failed, self.inserted, self.updated, error, self.run_id))
+        self.con.commit()
+
+    # ---- Open-Meteo forecast -------------------------------------------
+    def open_meteo_forecast(self, loc):
+        q = {"latitude": loc["latitude"], "longitude": loc["longitude"],
+             "hourly": ",".join(OM_HOURLY), "timezone": "GMT", "forecast_days": 16,
+             "wind_speed_unit": "kmh", "temperature_unit": "celsius", "precipitation_unit": "mm"}
+        url = OPEN_METEO_FORECAST + "?" + urllib.parse.urlencode(q)
+        body, raw_id = self.get(url, "open-meteo", "forecast", loc["id"])
+        h = json.loads(body)["hourly"]
+        fetched = utcnow()
+        rows = [(loc["id"], "open-meteo", to_utc(t), h["temperature_2m"][i], h["precipitation_probability"][i],
+                 h["precipitation"][i], h["wind_speed_10m"][i], h["wind_direction_10m"][i],
+                 h["wind_gusts_10m"][i], None, fetched, self.run_id, raw_id)
+                for i, t in enumerate(h["time"])]
+        return self._insert_forecast(rows)
+
+    # ---- NWS -----------------------------------------------------------
+    def nws_points(self, loc, max_age_days=30):
+        """Resolve (and cache on the locations row) the NWS grid + hourly forecast URL."""
+        if loc["nws_forecast_hourly_url"] and loc["nws_points_checked_at"]:
+            age = dt.datetime.now(dt.timezone.utc) - dt.datetime.fromisoformat(
+                loc["nws_points_checked_at"].replace("Z", "+00:00"))
+            if age.days < max_age_days:
+                return loc["nws_forecast_hourly_url"]
+        url = f"{NWS_BASE}/points/{loc['latitude']:.4f},{loc['longitude']:.4f}"
+        body, _ = self.get(url, "nws", "points", loc["id"], accept="application/geo+json")
+        p = json.loads(body)["properties"]
+        self.con.execute(
+            """UPDATE locations SET nws_office=?, nws_grid_x=?, nws_grid_y=?, nws_forecast_hourly_url=?,
+               nws_forecast_zone=?, nws_county=?, nws_points_checked_at=? WHERE id=?""",
+            (p.get("gridId"), p.get("gridX"), p.get("gridY"), p.get("forecastHourly"),
+             (p.get("forecastZone") or "").rsplit("/", 1)[-1], (p.get("county") or "").rsplit("/", 1)[-1],
+             utcnow(), loc["id"]))
+        return p["forecastHourly"]
+
+    def nws_hourly(self, loc):
+        url = self.nws_points(loc) + "?units=si"
+        body, raw_id = self.get(url, "nws", "forecast_hourly", loc["id"], accept="application/geo+json")
+        fetched = utcnow()
+        rows = []
+        for per in json.loads(body)["properties"]["periods"]:
+            temp = per.get("temperature")
+            if isinstance(temp, dict):
+                temp = temp.get("value")
+            if per.get("temperatureUnit") == "F" and temp is not None:
+                temp = round((temp - 32) * 5 / 9, 1)
+            pop = (per.get("probabilityOfPrecipitation") or {}).get("value")
+            ws = per.get("windSpeed")
+            if isinstance(ws, str):   # e.g. "15 km/h" or "10 to 15 km/h" (take the upper value)
+                nums = [float(x) for x in ws.replace("km/h", "").replace("mph", "").replace("to", " ").split()
+                        if x.replace(".", "").isdigit()]
+                ws = (nums[-1] * (1.609344 if "mph" in per["windSpeed"] else 1)) if nums else None
+            rows.append((loc["id"], "nws", to_utc(per["startTime"]), temp, pop, None, ws,
+                         COMPASS.get(per.get("windDirection")), None, per.get("shortForecast"),
+                         fetched, self.run_id, raw_id))
+        return self._insert_forecast(rows)
+
+    def nws_alerts(self, loc):
+        url = f"{NWS_BASE}/alerts/active?point={loc['latitude']:.4f},{loc['longitude']:.4f}"
+        body, _ = self.get(url, "nws", "alerts", loc["id"], accept="application/geo+json")
+        now, n = utcnow(), 0
+        for f in json.loads(body).get("features", []):
+            p = f["properties"]
+            aid = p.get("id") or f.get("id")
+            existed = self.con.execute("SELECT 1 FROM nws_alerts WHERE id=?", (aid,)).fetchone()
+            self.con.execute(
+                """INSERT INTO nws_alerts(id, location_id, event, severity, certainty, urgency, headline,
+                   description, instruction, area_desc, sent, onset, expires, ends, first_seen_at, last_seen_at, raw_json)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                   ON CONFLICT(id) DO UPDATE SET last_seen_at=excluded.last_seen_at, expires=excluded.expires,
+                   ends=excluded.ends, headline=excluded.headline, raw_json=excluded.raw_json""",
+                (aid, loc["id"], p.get("event"), p.get("severity"), p.get("certainty"), p.get("urgency"),
+                 p.get("headline"), p.get("description"), p.get("instruction"), p.get("areaDesc"),
+                 p.get("sent"), p.get("onset"), p.get("expires"), p.get("ends"), now, now, json.dumps(f)))
+            if existed:
+                self.updated += 1
+            else:
+                self.inserted += 1
+            n += 1
+        return n
+
+    def _insert_forecast(self, rows):
+        before = self.con.total_changes
+        self.con.executemany(
+            """INSERT OR IGNORE INTO forecast_hourly(location_id, source, valid_time, temperature_c,
+               precip_prob_pct, precip_mm, wind_speed_kmh, wind_dir_deg, wind_gust_kmh, short_forecast,
+               fetched_at, fetch_run_id, raw_response_id) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""", rows)
+        n = self.con.total_changes - before
+        self.inserted += n
+        self.con.commit()
+        return n
+
+
+def load_location(con, slug):
+    con.row_factory = sqlite3.Row
+    row = con.execute("SELECT * FROM locations WHERE slug=?", (slug,)).fetchone()
+    if not row:
+        slugs = [r[0] for r in con.execute("SELECT slug FROM locations")]
+        sys.exit(f"Unknown location {slug!r}. Known: {', '.join(slugs)}")
+    return dict(row)
+
+
+def main():
+    ap = argparse.ArgumentParser(description="Weather DB fetcher")
+    sub = ap.add_subparsers(dest="command", required=True)
+    f = sub.add_parser("forecast", help="hourly forecast (Open-Meteo and/or NWS)")
+    f.add_argument("--location", required=True)
+    f.add_argument("--source", choices=["open-meteo", "nws", "all"], default="all")
+    a = sub.add_parser("alerts", help="NWS active alerts for a location")
+    a.add_argument("--location", required=True)
+    sub.add_parser("locations", help="list configured locations")
+    ap.add_argument("--db", default=str(DB_PATH))
+    args = ap.parse_args()
+
+    import pathlib
+    con = init_db(pathlib.Path(args.db))
+    if args.command == "locations":
+        for r in con.execute("SELECT slug, name, state, latitude, longitude FROM locations"):
+            print(*r, sep="\t")
+        return
+
+    loc = load_location(con, args.location)
+    fx = Fetcher(con, args.command, {k: v for k, v in vars(args).items() if k != "db"})
+    errors, done = [], []
+    jobs = []
+    if args.command == "forecast":
+        if args.source in ("open-meteo", "all"):
+            jobs.append(("open-meteo forecast", fx.open_meteo_forecast))
+        if args.source in ("nws", "all"):
+            jobs.append(("nws hourly forecast", fx.nws_hourly))
+    elif args.command == "alerts":
+        jobs.append(("nws alerts", fx.nws_alerts))
+    for label, fn in jobs:
+        try:
+            n = fn(loc)
+            done.append(label)
+            print(f"{loc['slug']}: {label}: {n} rows")
+        except Exception as e:  # keep going; record the failure on the run
+            con.rollback()
+            errors.append(f"{label}: {e}")
+            print(f"{loc['slug']}: {label} FAILED: {e}", file=sys.stderr)
+    status = "ok" if not errors else ("partial" if done else "error")
+    fx.finish(status, "; ".join(errors) or None)
+    print(f"fetch_run {fx.run_id}: {status} ({fx.requests} requests, {fx.inserted} inserted, {fx.updated} updated)")
+    sys.exit(0 if status == "ok" else 1)
+
+
+if __name__ == "__main__":
+    main()
