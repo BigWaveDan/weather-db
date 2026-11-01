@@ -52,7 +52,8 @@ CREATE TABLE IF NOT EXISTS raw_responses (
     content_type    TEXT,
     body_sha256     TEXT,
     body_bytes      INTEGER,
-    body_gzip       BLOB
+    body_gzip       BLOB,                          -- NULL once pruned (see retention in README)
+    body_pruned_at  TEXT
 );
 CREATE INDEX IF NOT EXISTS ix_raw_source ON raw_responses(source, endpoint, fetched_at);
 
@@ -85,7 +86,8 @@ JOIN (SELECT location_id, source, MAX(fetched_at) AS fetched_at
       FROM forecast_hourly GROUP BY location_id, source) m
   ON m.location_id = f.location_id AND m.source = f.source AND m.fetched_at = f.fetched_at;
 
--- Historical/observed hourly data (Open-Meteo Historical Weather API, ERA5-based).
+-- Historical hourly data (Open-Meteo Historical Weather API, default 'best match' reanalysis:
+-- ERA5 family, with ECMWF IFS analysis filling the most recent days until ERA5 catches up).
 -- Upsert: one row per location+hour; a later fetch overwrites (archive data can be revised).
 CREATE TABLE IF NOT EXISTS observations_hourly (
     id              INTEGER PRIMARY KEY,
@@ -96,6 +98,8 @@ CREATE TABLE IF NOT EXISTS observations_hourly (
     wind_speed_kmh  REAL,
     wind_dir_deg    REAL,
     wind_gust_kmh   REAL,
+    relative_humidity_pct REAL,
+    pressure_msl_hpa REAL,
     source          TEXT NOT NULL DEFAULT 'open-meteo-archive',
     fetched_at      TEXT NOT NULL,
     raw_response_id INTEGER REFERENCES raw_responses(id),
@@ -165,11 +169,13 @@ CREATE TABLE IF NOT EXISTS backfill_progress (
     target_oldest_date  TEXT NOT NULL DEFAULT '1940-01-01',
     chunk_days          INTEGER NOT NULL DEFAULT 30,
     updated_at          TEXT,
-    done                INTEGER NOT NULL DEFAULT 0
+    done                INTEGER NOT NULL DEFAULT 0,
+    chunks_fetched      INTEGER NOT NULL DEFAULT 0,
+    last_error          TEXT
 );
 
 CREATE TABLE IF NOT EXISTS schema_meta (key TEXT PRIMARY KEY, value TEXT);
-INSERT OR REPLACE INTO schema_meta(key, value) VALUES ('schema_version', '2');
+INSERT OR REPLACE INTO schema_meta(key, value) VALUES ('schema_version', '3');
 
 -- Seed locations (US Census Bureau 2024 Gazetteer place internal points).
 INSERT OR IGNORE INTO locations (slug, name, state, latitude, longitude, timezone, coord_source) VALUES

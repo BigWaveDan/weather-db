@@ -10,6 +10,9 @@ MIGRATIONS = {
     "spc_outlooks": [("valid_from", "TEXT"), ("valid_to", "TEXT"), ("wmo_header", "TEXT"),
                      ("layer_url", "TEXT"), ("layer_issued", "TEXT"), ("layer_status", "TEXT")],
     "spc_location_risk": [("risk_dn", "INTEGER"), ("checked_at", "TEXT")],
+    "observations_hourly": [("relative_humidity_pct", "REAL"), ("pressure_msl_hpa", "REAL")],
+    "backfill_progress": [("chunks_fetched", "INTEGER NOT NULL DEFAULT 0"), ("last_error", "TEXT")],
+    "raw_responses": [("body_pruned_at", "TEXT")],
 }
 
 

@@ -6,6 +6,8 @@ Usage:
   python fetch.py forecast --location worthington-mn [--source open-meteo|nws|all]
   python fetch.py alerts   --location worthington-mn
   python fetch.py spc      [--day 1|2]                  # SPC outlook text + per-location risk
+  python fetch.py backfill [--location X|all] [--chunks 3]  # walk history backward, 30 days per chunk
+  python fetch.py prune                                 # retention (also runs at the end of `all`)
   python fetch.py locations
 
 All logic lives here; the future website only reads data/weather.db.
@@ -21,6 +23,19 @@ MAX_RETRIES = 5               # on 429 / 5xx / network errors
 BACKOFF_BASE_S = 2.0          # 2, 4, 8, 16, 32 s (+ jitter); honours Retry-After
 
 OPEN_METEO_FORECAST = "https://api.open-meteo.com/v1/forecast"
+OPEN_METEO_ARCHIVE = "https://archive-api.open-meteo.com/v1/archive"
+# 7 variables (< 10, so a 30-day chunk is weighted ~2-3 calls by Open-Meteo, not more).
+OM_ARCHIVE_HOURLY = ["temperature_2m", "precipitation", "wind_speed_10m", "wind_direction_10m",
+                     "wind_gusts_10m", "relative_humidity_2m", "pressure_msl"]
+ARCHIVE_SLEEP_S = 2.5         # extra-generous pause between archive calls
+BACKFILL_CHUNK_DAYS = 30
+BACKFILL_TOPUP_DAYS = 7       # re-fetch this many trailing days so recent (IFS) values get ERA5 revisions
+# Open-Meteo free tier (https://open-meteo.com/en/terms): < 600 calls/min, 5,000/hour, 10,000/day, 300,000/month.
+# Stay far below: hard cap per run on *weighted* archive calls.
+MAX_WEIGHTED_ARCHIVE_CALLS_PER_RUN = 300
+RAW_BODY_RETENTION_DAYS = 7
+FORECAST_FULL_RETENTION_DAYS = 2
+FORECAST_THIN_WINDOW_HOURS = 6
 OM_HOURLY = ["temperature_2m", "precipitation_probability", "precipitation",
              "wind_speed_10m", "wind_direction_10m", "wind_gusts_10m"]
 NWS_BASE = "https://api.weather.gov"
@@ -49,6 +64,15 @@ def to_utc(ts):
     return t.astimezone(dt.timezone.utc).isoformat().replace("+00:00", "Z")
 
 
+class RateLimited(RuntimeError):
+    """Raised (instead of retrying) when a caller asked to stop on HTTP 429."""
+
+
+def om_weight(days, n_vars):
+    """Open-Meteo's documented fractional call weight: >10 variables or >2 weeks count as multiple calls."""
+    return max(1.0, n_vars / 10) * max(1.0, days / 14)
+
+
 class Fetcher:
     def __init__(self, con, command, args):
         self.con = con
@@ -61,10 +85,12 @@ class Fetcher:
         self.warnings = []   # degraded-but-not-failed sources (e.g. SPC layer unreachable -> text only)
 
     # ---- HTTP -----------------------------------------------------------
-    def get(self, url, source, endpoint, location_id=None, accept="application/json"):
-        """GET with polite pacing and retry/backoff. Stores every final response in raw_responses."""
+    def get(self, url, source, endpoint, location_id=None, accept="application/json",
+            stop_on_429=False, min_interval=POLITE_SLEEP_S):
+        """GET with polite pacing and retry/backoff. Stores every final response in raw_responses.
+        stop_on_429=True raises RateLimited on the first 429 instead of retrying."""
         for attempt in range(MAX_RETRIES + 1):
-            wait = POLITE_SLEEP_S - (time.monotonic() - self._last_request)
+            wait = min_interval - (time.monotonic() - self._last_request)
             if wait > 0:
                 time.sleep(wait)
             self._last_request = time.monotonic()
@@ -79,6 +105,10 @@ class Fetcher:
                 retry_after = e.headers.get("Retry-After")
             except (urllib.error.URLError, TimeoutError, ConnectionError) as e:
                 body = str(e).encode()
+            if status == 429 and stop_on_429:
+                self.failed += 1
+                self._store_raw(source, endpoint, url, location_id, status, ctype, body)
+                raise RateLimited(f"HTTP 429 from {url.split('?')[0]}: {body[:120]!r}")
             retryable = status is None or status == 429 or status >= 500
             if retryable and attempt < MAX_RETRIES:
                 self.failed += 1
@@ -263,6 +293,147 @@ class Fetcher:
         detail = ", ".join(f"{by_slug[k]}={v[0]}" for k, v in risks.items()) or "no point check"
         return f"issued {issued}, max {max_risk}, layer {status}; {detail}"
 
+    # ---- Historical backfill (Open-Meteo archive) ----------------------
+    def archive_chunk(self, loc, start, end):
+        """Fetch [start, end] (dates, UTC) hourly from the archive and upsert into observations_hourly."""
+        q = {"latitude": loc["latitude"], "longitude": loc["longitude"],
+             "start_date": start.isoformat(), "end_date": end.isoformat(),
+             "hourly": ",".join(OM_ARCHIVE_HOURLY), "timezone": "GMT",
+             "wind_speed_unit": "kmh", "temperature_unit": "celsius", "precipitation_unit": "mm"}
+        url = OPEN_METEO_ARCHIVE + "?" + urllib.parse.urlencode(q)
+        body, raw_id = self.get(url, "open-meteo-archive", "archive", loc["id"],
+                                stop_on_429=True, min_interval=ARCHIVE_SLEEP_S)
+        h = json.loads(body)["hourly"]
+        fetched = utcnow()
+        rows, skipped = [], 0
+        for i, t in enumerate(h["time"]):
+            vals = [h[k][i] for k in OM_ARCHIVE_HOURLY]
+            if all(v is None for v in vals):
+                skipped += 1          # hour not available (yet) - don't store an empty row
+                continue
+            rows.append((loc["id"], to_utc(t), *vals, fetched, raw_id))
+        before_rows = self.con.execute("SELECT COUNT(*) FROM observations_hourly WHERE location_id=?",
+                                       (loc["id"],)).fetchone()[0]
+        self.con.executemany(
+            """INSERT INTO observations_hourly(location_id, time, temperature_c, precip_mm, wind_speed_kmh,
+               wind_dir_deg, wind_gust_kmh, relative_humidity_pct, pressure_msl_hpa, fetched_at, raw_response_id)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?)
+               ON CONFLICT(location_id, time) DO UPDATE SET temperature_c=excluded.temperature_c,
+               precip_mm=excluded.precip_mm, wind_speed_kmh=excluded.wind_speed_kmh,
+               wind_dir_deg=excluded.wind_dir_deg, wind_gust_kmh=excluded.wind_gust_kmh,
+               relative_humidity_pct=excluded.relative_humidity_pct, pressure_msl_hpa=excluded.pressure_msl_hpa,
+               fetched_at=excluded.fetched_at, raw_response_id=excluded.raw_response_id""", rows)
+        after_rows = self.con.execute("SELECT COUNT(*) FROM observations_hourly WHERE location_id=?",
+                                      (loc["id"],)).fetchone()[0]
+        new = after_rows - before_rows
+        self.inserted += new
+        self.updated += len(rows) - new
+        return len(rows), new, skipped
+
+    def backfill(self, locations, chunks):
+        """Walk each location backward in 30-day chunks, round-robin, saving progress after every chunk.
+        First (per run) tops up the trailing window up to yesterday. Stops cleanly on HTTP 429."""
+        yesterday = dt.datetime.now(dt.timezone.utc).date() - dt.timedelta(days=1)
+        weighted, log = 0.0, []
+        n_vars = len(OM_ARCHIVE_HOURLY)
+
+        def progress(loc):
+            return dict(self.con.execute("SELECT * FROM backfill_progress WHERE location_id=?",
+                                         (loc["id"],)).fetchone())
+
+        def save(loc, **kw):
+            kw["updated_at"] = utcnow()
+            sets = ", ".join(f"{k}=?" for k in kw)
+            self.con.execute(f"UPDATE backfill_progress SET {sets} WHERE location_id=?", (*kw.values(), loc["id"]))
+            self.con.commit()
+
+        plan = []   # (loc, kind)
+        for loc in locations:
+            pr = progress(loc)
+            if pr["newest_date_fetched"] and pr["newest_date_fetched"] < yesterday.isoformat():
+                plan.append((loc, "topup"))
+        for _ in range(chunks):
+            plan.extend((loc, "back") for loc in locations)
+
+        failed = set()
+        for loc, kind in plan:
+            if loc["id"] in failed:
+                continue
+            pr = progress(loc)
+            target = dt.date.fromisoformat(pr["target_oldest_date"])
+            if kind == "topup":
+                end = yesterday
+                start = max(dt.date.fromisoformat(pr["newest_date_fetched"]) - dt.timedelta(days=BACKFILL_TOPUP_DAYS - 1),
+                            target)
+            else:
+                if pr["done"]:
+                    continue
+                end = (dt.date.fromisoformat(pr["oldest_date_fetched"]) - dt.timedelta(days=1)
+                       if pr["oldest_date_fetched"] else yesterday)
+                if end < target:
+                    save(loc, done=1)
+                    continue
+                start = max(end - dt.timedelta(days=(pr["chunk_days"] or BACKFILL_CHUNK_DAYS) - 1), target)
+            w = om_weight((end - start).days + 1, n_vars)
+            if weighted + w > MAX_WEIGHTED_ARCHIVE_CALLS_PER_RUN:
+                log.append(f"stopped: per-run weighted-call cap {MAX_WEIGHTED_ARCHIVE_CALLS_PER_RUN} reached")
+                break
+            try:
+                stored, new, skipped = self.archive_chunk(loc, start, end)
+            except RateLimited as e:
+                save(loc, last_error=str(e)[:300])
+                self.warnings.append(f"backfill stopped on 429 at {loc['slug']} {start}..{end}; progress saved")
+                log.append(f"{loc['slug']} {start}..{end}: 429 - stopping, progress saved")
+                break
+            except Exception as e:
+                save(loc, last_error=str(e)[:300])
+                self.warnings.append(f"backfill {loc['slug']} {start}..{end}: {e}"[:200])
+                log.append(f"{loc['slug']} {start}..{end}: FAILED {e}"[:200])
+                failed.add(loc["id"])
+                continue    # other locations can still progress; this one retries next run
+            weighted += w
+            if kind == "topup":
+                save(loc, newest_date_fetched=end.isoformat(), last_error=None)
+            else:
+                save(loc, oldest_date_fetched=start.isoformat(),
+                     newest_date_fetched=pr["newest_date_fetched"] or end.isoformat(),
+                     done=int(start <= target), chunks_fetched=pr["chunks_fetched"] + 1, last_error=None)
+            msg = f"{loc['slug']} {kind} {start}..{end}: {stored} rows ({new} new"
+            msg += f", {skipped} empty hours skipped)" if skipped else ")"
+            log.append(msg)
+            print("  " + msg)
+        return f"{len([l for l in log if ': ' in l and 'rows' in l])} chunks, ~{weighted:.1f} weighted Open-Meteo calls" + \
+            ("; " + log[-1] if log and "stop" in log[-1] else "")
+
+    # ---- Retention ------------------------------------------------------
+    def prune(self, now=None):
+        """Keep the committed DB small:
+        - raw_responses older than 7 days: drop the body, keep metadata + sha256.
+        - forecast snapshots older than 2 days: keep only the newest snapshot per location+source
+          per 6-hour UTC window of fetched_at. The newest snapshot per location+source (forecast_latest)
+          is never deleted."""
+        now = now or dt.datetime.now(dt.timezone.utc)
+        iso = lambda t: t.replace(microsecond=0).isoformat().replace("+00:00", "Z")
+        raw_cut = iso(now - dt.timedelta(days=RAW_BODY_RETENTION_DAYS))
+        fc_cut = iso(now - dt.timedelta(days=FORECAST_FULL_RETENTION_DAYS))
+        c1 = self.con.execute("""UPDATE raw_responses SET body_gzip=NULL, body_pruned_at=?
+                                 WHERE fetched_at < ? AND body_gzip IS NOT NULL""", (iso(now), raw_cut)).rowcount
+        c2 = self.con.execute(f"""
+            DELETE FROM forecast_hourly
+            WHERE fetched_at < :cut
+              AND (location_id, source, fetched_at) NOT IN (
+                    SELECT location_id, source, MAX(fetched_at) FROM forecast_hourly GROUP BY location_id, source)
+              AND (location_id, source, fetched_at) NOT IN (
+                    SELECT location_id, source, MAX(fetched_at) FROM forecast_hourly
+                    WHERE fetched_at < :cut
+                    GROUP BY location_id, source, substr(fetched_at, 1, 10),
+                             CAST(substr(fetched_at, 12, 2) AS INTEGER) / {FORECAST_THIN_WINDOW_HOURS})""",
+                              {"cut": fc_cut}).rowcount
+        self.con.commit()
+        self.updated += c1
+        self.con.execute("VACUUM")
+        return f"{c1} raw bodies dropped, {c2} old forecast rows thinned"
+
     def _insert_forecast(self, rows):
         before = self.con.total_changes
         self.con.executemany(
@@ -369,7 +540,11 @@ def main():
     a.add_argument("--location", required=True)
     sp = sub.add_parser("spc", help="SPC convective outlooks + per-location risk")
     sp.add_argument("--day", type=int, choices=[1, 2], action="append")
-    sub.add_parser("all", help="every current source for every location")
+    sub.add_parser("all", help="every current source for every location, then prune")
+    b = sub.add_parser("backfill", help="walk Open-Meteo archive history backward, 30-day chunks")
+    b.add_argument("--location", default="all")
+    b.add_argument("--chunks", type=int, default=3, help="chunks per location this run (default 3)")
+    sub.add_parser("prune", help="apply retention rules and VACUUM")
     sub.add_parser("locations", help="list configured locations")
     ap.add_argument("--db", default=str(DB_PATH))
     args = ap.parse_args()
@@ -387,6 +562,10 @@ def main():
     jobs = []   # (label, callable) - each job succeeds or fails on its own
     if args.command in ("forecast", "alerts"):
         locs = [load_location(con, args.location)]
+    elif args.command == "backfill":
+        bl = all_locs if args.location == "all" else [load_location(con, args.location)]
+        jobs.append(("backfill", lambda: fx.backfill(bl, args.chunks)))
+        locs = []
     elif args.command == "all":
         locs = all_locs
     else:
@@ -402,6 +581,8 @@ def main():
     if args.command in ("spc", "all"):
         for day in (getattr(args, "day", None) or [1, 2]):
             jobs.append((f"spc day {day}", lambda d=day: fx.spc_outlook(d, all_locs)))
+    if args.command in ("all", "prune"):
+        jobs.append(("prune", fx.prune))
     errors, done = [], []
     for label, fn in jobs:
         try:
