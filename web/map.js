@@ -100,7 +100,7 @@ function drawPins() {
     L.tileLayer("https://tile.openstreetmap.org/{z}/{x}/{y}.png", {
       maxZoom: 18, attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors',
     }).addTo(map);
-    map.fitBounds(cur.map((c) => [c.latitude, c.longitude]), { padding: [70, 60] });
+    map.fitBounds(cur.map((c) => [c.latitude, c.longitude]), { paddingTopLeft: [110, 60], paddingBottomRight: [90, 40] });
     $("list").innerHTML = cur.map((c) => `<button data-slug="${c.slug}">${esc(c.name)}</button>`).join("");
     $("list").querySelectorAll("button").forEach((b) => b.addEventListener("click", () => {
       select(b.dataset.slug); map.panTo(markers[b.dataset.slug].getLatLng());
