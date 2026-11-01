@@ -8,6 +8,7 @@ Usage:
   python fetch.py spc      [--day 1|2]                  # SPC outlook text + per-location risk
   python fetch.py backfill [--location X|all] [--chunks 3]  # walk history backward, 30 days per chunk
   python fetch.py prune                                 # retention (also runs at the end of `all`)
+  python fetch.py derive                                # rebuild observations_daily (site aggregates)
   python fetch.py locations
 
 All logic lives here; the future website only reads data/weather.db.
@@ -41,7 +42,7 @@ OM_HOURLY = ["temperature_2m", "precipitation_probability", "precipitation",
 NWS_BASE = "https://api.weather.gov"
 SPC_TEXT = "https://www.spc.noaa.gov/products/outlook/day{day}otlk.txt"
 SPC_CAT_GEOJSON = "https://www.spc.noaa.gov/products/outlook/day{day}otlk_cat.nolyr.geojson"
-SPC_DN = {"TSTM": 2, "MRGL": 3, "SLGT": 4, "ENH": 5, "MDT": 6, "HIGH": 7}
+SPC_DN = {"TSTM": 2, "MRGL": 3, "SLGT": 4, "ENH": 5, "MDT": 6, "HIGH": 8}   # SPC DN codes
 # Headline phrases in the SPC text, highest first.
 SPC_TEXT_RISK = [("HIGH RISK", "HIGH"), ("MODERATE RISK", "MDT"), ("ENHANCED RISK", "ENH"),
                  ("SLIGHT RISK", "SLGT"), ("MARGINAL RISK", "MRGL")]
@@ -405,6 +406,35 @@ class Fetcher:
         return f"{len([l for l in log if ': ' in l and 'rows' in l])} chunks, ~{weighted:.1f} weighted Open-Meteo calls" + \
             ("; " + log[-1] if log and "stop" in log[-1] else "")
 
+    # ---- Derived tables for the site -----------------------------------
+    def derive(self):
+        """Rebuild observations_daily: aggregates per location-LOCAL calendar day (IANA zone, DST-aware).
+        Only complete local days (>= 23 hourly rows) are written."""
+        from zoneinfo import ZoneInfo
+        self.con.execute("DELETE FROM observations_daily")
+        n = 0
+        for loc_id, tzname in self.con.execute("SELECT id, timezone FROM locations").fetchall():
+            tz = ZoneInfo(tzname)
+            days = {}
+            for t, temp, pr, ws, gu in self.con.execute(
+                    """SELECT time, temperature_c, precip_mm, wind_speed_kmh, wind_gust_kmh
+                       FROM observations_hourly WHERE location_id=? ORDER BY time""", (loc_id,)):
+                d = dt.datetime.fromisoformat(t.replace("Z", "+00:00")).astimezone(tz).date().isoformat()
+                days.setdefault(d, []).append((temp, pr, ws, gu))
+            rows = []
+            for d, hrs in days.items():
+                if len(hrs) < 23:     # partial local day at either end of the record (DST days have 23/25)
+                    continue
+                col = lambda i: [h[i] for h in hrs if h[i] is not None]
+                t, p, w, g = col(0), col(1), col(2), col(3)
+                rows.append((loc_id, d, len(hrs), min(t) if t else None, max(t) if t else None,
+                             round(sum(t) / len(t), 2) if t else None, round(sum(p), 2) if p else None,
+                             round(sum(w) / len(w), 2) if w else None, max(w) if w else None, max(g) if g else None))
+            self.con.executemany("INSERT INTO observations_daily VALUES (?,?,?,?,?,?,?,?,?,?)", rows)
+            n += len(rows)
+        self.con.commit()
+        return n
+
     # ---- Retention ------------------------------------------------------
     def prune(self, now=None):
         """Keep the committed DB small:
@@ -545,6 +575,7 @@ def main():
     b.add_argument("--location", default="all")
     b.add_argument("--chunks", type=int, default=3, help="chunks per location this run (default 3)")
     sub.add_parser("prune", help="apply retention rules and VACUUM")
+    sub.add_parser("derive", help="rebuild derived tables for the website (observations_daily)")
     sub.add_parser("locations", help="list configured locations")
     ap.add_argument("--db", default=str(DB_PATH))
     args = ap.parse_args()
@@ -581,6 +612,8 @@ def main():
     if args.command in ("spc", "all"):
         for day in (getattr(args, "day", None) or [1, 2]):
             jobs.append((f"spc day {day}", lambda d=day: fx.spc_outlook(d, all_locs)))
+    if args.command in ("all", "backfill", "derive"):
+        jobs.append(("derive daily aggregates", fx.derive))
     if args.command in ("all", "prune"):
         jobs.append(("prune", fx.prune))
     errors, done = [], []

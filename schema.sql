@@ -20,7 +20,8 @@ CREATE TABLE IF NOT EXISTS locations (
     nws_forecast_hourly_url TEXT,
     nws_forecast_zone TEXT,
     nws_county      TEXT,
-    nws_points_checked_at TEXT
+    nws_points_checked_at TEXT,
+    map_label_side  TEXT NOT NULL DEFAULT 'center'   -- site pin label placement: left | right | center
 );
 
 -- One row per invocation of fetch.py (any sub-command).
@@ -175,7 +176,7 @@ CREATE TABLE IF NOT EXISTS backfill_progress (
 );
 
 CREATE TABLE IF NOT EXISTS schema_meta (key TEXT PRIMARY KEY, value TEXT);
-INSERT OR REPLACE INTO schema_meta(key, value) VALUES ('schema_version', '3');
+INSERT OR REPLACE INTO schema_meta(key, value) VALUES ('schema_version', '4');
 
 -- Seed locations (US Census Bureau 2024 Gazetteer place internal points).
 INSERT OR IGNORE INTO locations (slug, name, state, latitude, longitude, timezone, coord_source) VALUES
@@ -183,5 +184,135 @@ INSERT OR IGNORE INTO locations (slug, name, state, latitude, longitude, timezon
  ('brandon-sd',     'Brandon',     'SD', 43.592908, -96.583769, 'America/Chicago',  'US Census 2024 Gazetteer (GEOID 4606840)'),
  ('tampa-fl',       'Tampa',       'FL', 27.970086, -82.479673, 'America/New_York', 'US Census 2024 Gazetteer (GEOID 1271000)');
 
+-- Worthington and Brandon are ~85 km apart: put their pin labels on opposite sides.
+UPDATE locations SET map_label_side = CASE slug WHEN 'brandon-sd' THEN 'left' WHEN 'worthington-mn' THEN 'right'
+                                                ELSE map_label_side END;
+
 INSERT OR IGNORE INTO backfill_progress (location_id)
 SELECT id FROM locations;
+
+-- =====================================================================
+-- Website support (milestone 4). The static site only runs simple SELECTs
+-- against these; every bit of logic lives here or in fetch.py.
+-- Views that use 'now' are evaluated by sql.js with the viewer's clock.
+-- =====================================================================
+
+-- Daily aggregates per LOCAL calendar day, rebuilt by `fetch.py derive`
+-- (also at the end of `backfill` and `all`) using each location's IANA zone.
+CREATE TABLE IF NOT EXISTS observations_daily (
+    location_id     INTEGER NOT NULL REFERENCES locations(id),
+    date            TEXT NOT NULL,                 -- YYYY-MM-DD, location-local
+    hours           INTEGER NOT NULL,              -- hourly rows in that day (23-25 on DST days)
+    temp_min_c      REAL,
+    temp_max_c      REAL,
+    temp_avg_c      REAL,
+    precip_mm       REAL,
+    wind_avg_kmh    REAL,
+    wind_max_kmh    REAL,
+    gust_max_kmh    REAL,
+    PRIMARY KEY (location_id, date)
+);
+
+-- SPC categorical legend (colors from SPC's own GeoJSON fill values).
+CREATE TABLE IF NOT EXISTS spc_categories (
+    label TEXT PRIMARY KEY, dn INTEGER NOT NULL, name TEXT NOT NULL, color TEXT NOT NULL, text_color TEXT NOT NULL
+);
+INSERT OR REPLACE INTO spc_categories VALUES
+ ('NONE', 0, 'No thunderstorms', '#9AA0A6', '#111111'),
+ ('TSTM', 2, 'General thunderstorms', '#C1E9C1', '#111111'),
+ ('MRGL', 3, 'Marginal', '#66A366', '#FFFFFF'),
+ ('SLGT', 4, 'Slight', '#FFE066', '#111111'),
+ ('ENH', 5, 'Enhanced', '#FFA366', '#111111'),
+ ('MDT', 6, 'Moderate', '#E06666', '#FFFFFF'),
+ ('HIGH', 8, 'High', '#EE99EE', '#111111');
+
+DROP VIEW IF EXISTS site_data_status;
+CREATE VIEW site_data_status AS
+SELECT l.id AS location_id, l.slug, l.name, l.state,
+       (SELECT MIN(time) FROM observations_hourly o WHERE o.location_id = l.id) AS history_from,
+       (SELECT MAX(time) FROM observations_hourly o WHERE o.location_id = l.id) AS history_through,
+       (SELECT MAX(date) FROM observations_daily d WHERE d.location_id = l.id) AS history_through_local_date,
+       (SELECT MAX(fetched_at) FROM forecast_hourly f WHERE f.location_id = l.id) AS forecast_fetched_at,
+       (SELECT MAX(finished_at) FROM fetch_runs WHERE status IN ('ok','partial')) AS last_run_finished_at
+FROM locations l;
+
+-- Latest NWS alerts that are still active: seen in the location's most recent alerts
+-- fetch and not yet expired/ended.
+DROP VIEW IF EXISTS site_active_alerts;
+CREATE VIEW site_active_alerts AS
+SELECT a.location_id, a.id, a.event, a.severity, a.urgency, a.certainty, a.headline,
+       a.onset, a.expires, a.ends, a.last_seen_at,
+       CASE a.severity WHEN 'Extreme' THEN 4 WHEN 'Severe' THEN 3 WHEN 'Moderate' THEN 2
+                       WHEN 'Minor' THEN 1 ELSE 0 END AS severity_rank
+FROM nws_alerts a
+WHERE a.last_seen_at >= (SELECT MAX(r.fetched_at) FROM raw_responses r
+                         WHERE r.source = 'nws' AND r.endpoint = 'alerts' AND r.location_id = a.location_id
+                           AND r.http_status = 200) 
+  AND julianday(COALESCE(a.ends, a.expires, '9999-12-31')) > julianday('now');
+
+-- SPC risk per location for the latest Day 1 and Day 2 issuance.
+DROP VIEW IF EXISTS site_spc_risk;
+CREATE VIEW site_spc_risk AS
+SELECT r.location_id, o.day, o.issued, o.valid_from, o.valid_to, o.max_risk AS national_max_risk,
+       o.layer_status, r.risk, c.name AS risk_name, c.color AS risk_color, c.text_color AS risk_text_color
+FROM spc_outlooks o
+JOIN (SELECT day, MAX(issued) AS issued FROM spc_outlooks GROUP BY day) m ON m.day = o.day AND m.issued = o.issued
+JOIN spc_location_risk r ON r.outlook_id = o.id
+LEFT JOIN spc_categories c ON c.label = r.risk;
+
+-- Forecast hours from the latest snapshot, ranked from the current hour (rank 0) onward.
+DROP VIEW IF EXISTS site_forecast_upcoming;
+CREATE VIEW site_forecast_upcoming AS
+SELECT f.*, CAST(strftime('%s', f.valid_time) AS INTEGER) AS epoch,
+       ROW_NUMBER() OVER (PARTITION BY f.location_id, f.source ORDER BY f.valid_time) - 1 AS hour_rank
+FROM forecast_latest f
+WHERE f.valid_time >= strftime('%Y-%m-%dT%H:00:00Z', 'now');
+
+
+-- One row per location: everything a map pin needs.
+DROP VIEW IF EXISTS site_current_conditions;
+CREATE VIEW site_current_conditions AS
+WITH om AS (
+    SELECT * FROM (
+        SELECT f.*, ROW_NUMBER() OVER (PARTITION BY f.location_id
+               ORDER BY ABS(julianday(f.valid_time) + 1.0/48 - julianday('now'))) AS rn
+        FROM forecast_latest f WHERE f.source = 'open-meteo') WHERE rn = 1),
+nws AS (
+    SELECT * FROM (
+        SELECT f.*, ROW_NUMBER() OVER (PARTITION BY f.location_id
+               ORDER BY ABS(julianday(f.valid_time) + 1.0/48 - julianday('now'))) AS rn
+        FROM forecast_latest f WHERE f.source = 'nws') WHERE rn = 1)
+SELECT l.id AS location_id, l.slug, l.name, l.state, l.latitude, l.longitude, l.timezone, l.map_label_side,
+       om.valid_time, om.temperature_c, om.precip_prob_pct, om.precip_mm,
+       om.wind_speed_kmh, om.wind_dir_deg, om.wind_gust_kmh, om.fetched_at AS om_fetched_at,
+       nws.temperature_c AS nws_temperature_c, nws.short_forecast, nws.fetched_at AS nws_fetched_at,
+       CASE
+         WHEN nws.short_forecast IS NULL THEN 'unknown'
+         WHEN lower(nws.short_forecast) LIKE '%thunder%' OR lower(nws.short_forecast) LIKE '%t-storm%' THEN 'storm'
+         WHEN lower(nws.short_forecast) LIKE '%snow%' OR lower(nws.short_forecast) LIKE '%flurr%'
+           OR lower(nws.short_forecast) LIKE '%sleet%' OR lower(nws.short_forecast) LIKE '%freezing%' THEN 'snow'
+         WHEN lower(nws.short_forecast) LIKE '%rain%' OR lower(nws.short_forecast) LIKE '%shower%'
+           OR lower(nws.short_forecast) LIKE '%drizzle%' THEN 'rain'
+         WHEN lower(nws.short_forecast) LIKE '%fog%' OR lower(nws.short_forecast) LIKE '%haze%'
+           OR lower(nws.short_forecast) LIKE '%smoke%' THEN 'fog'
+         WHEN lower(nws.short_forecast) LIKE '%partly%' OR lower(nws.short_forecast) LIKE '%mostly sunny%'
+           OR lower(nws.short_forecast) LIKE '%mostly clear%' THEN 'partly'
+         WHEN lower(nws.short_forecast) LIKE '%cloudy%' OR lower(nws.short_forecast) LIKE '%overcast%' THEN 'cloudy'
+         WHEN lower(nws.short_forecast) LIKE '%sunny%' THEN 'sunny'
+         WHEN lower(nws.short_forecast) LIKE '%clear%' THEN 'clear'
+         WHEN lower(nws.short_forecast) LIKE '%wind%' OR lower(nws.short_forecast) LIKE '%breezy%' THEN 'wind'
+         ELSE 'cloudy' END AS condition_key,
+       (SELECT COUNT(*) FROM site_active_alerts a WHERE a.location_id = l.id) AS alert_count,
+       (SELECT MAX(severity_rank) FROM site_active_alerts a WHERE a.location_id = l.id) AS alert_max_severity_rank,
+       d1.risk AS spc_day1_risk, d1.risk_name AS spc_day1_name, d1.risk_color AS spc_day1_color,
+       d1.risk_text_color AS spc_day1_text_color, d1.issued AS spc_day1_issued,
+       d2.risk AS spc_day2_risk, d2.risk_name AS spc_day2_name, d2.risk_color AS spc_day2_color,
+       d2.risk_text_color AS spc_day2_text_color, d2.issued AS spc_day2_issued,
+       (SELECT MAX(last_seen_at) FROM nws_alerts WHERE location_id = l.id) AS alerts_last_seen_at,
+       (SELECT MAX(r.fetched_at) FROM raw_responses r WHERE r.source='nws' AND r.endpoint='alerts'
+          AND r.location_id = l.id AND r.http_status = 200) AS alerts_checked_at
+FROM locations l
+LEFT JOIN om ON om.location_id = l.id
+LEFT JOIN nws ON nws.location_id = l.id
+LEFT JOIN site_spc_risk d1 ON d1.location_id = l.id AND d1.day = 1
+LEFT JOIN site_spc_risk d2 ON d2.location_id = l.id AND d2.day = 2;

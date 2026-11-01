@@ -1,0 +1,72 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Weather DB · Map</title>
+<link rel="stylesheet" href="vendor/leaflet.css">
+<link rel="stylesheet" href="common.css">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22%3E%3Ctext y=%22.9em%22 font-size=%2290%22%3E%E2%9B%85%3C/text%3E%3C/svg%3E">
+<style>
+  .layout { display: grid; grid-template-columns: 1fr 360px; gap: .9rem; }
+  #map { height: calc(100vh - 140px); min-height: 420px; border-radius: 12px; border: 1px solid var(--border); }
+  @media (max-width: 860px) { .layout { grid-template-columns: 1fr; } #map { height: 52vh; min-height: 300px; } }
+  .pinwrap { position: relative; width: 0; height: 0; }
+  .pinwrap .dot { position: absolute; left: -5px; top: -5px; width: 10px; height: 10px; border-radius: 50%;
+    border: 2px solid var(--fg); box-sizing: border-box; }
+  .pinwrap .pin { position: absolute; top: 0; }
+  .side-center .pin { transform: translate(-50%, -130%); }
+  .side-right .pin { transform: translate(10px, -50%); }
+  .side-left .pin { transform: translate(calc(-100% - 10px), -50%); }
+  .pin { display: flex; align-items: center; gap: 4px; padding: 3px 8px 3px 5px; border-radius: 999px;
+    background: var(--bg); color: var(--fg); border: 3px solid #999; font-weight: 700; font-size: 14px;
+    box-shadow: 0 2px 6px rgba(0,0,0,.35); white-space: nowrap; cursor: pointer; width: max-content; }
+  .pin .ic { font-size: 17px; line-height: 1; }
+  .pin.sel { outline: 3px solid var(--accent); outline-offset: 1px; }
+  .badge { position: absolute; top: -9px; right: -9px; background: var(--alert); color: #fff; border-radius: 999px;
+    min-width: 19px; height: 19px; font-size: 11px; display: grid; place-items: center; padding: 0 4px; border: 2px solid var(--bg); }
+  .card { background: var(--card); border: 1px solid var(--border); border-radius: 12px; padding: .8rem .9rem; margin-bottom: .7rem; }
+  .card h2 { margin: 0 0 .15rem; font-size: 1.05rem; display: flex; justify-content: space-between; gap: .5rem; }
+  .now { display: flex; align-items: center; gap: .6rem; margin: .3rem 0 .4rem; }
+  .now .big { font-size: 2.2rem; font-weight: 700; }
+  .now .ic { font-size: 2rem; }
+  .kv { display: grid; grid-template-columns: auto 1fr; gap: .15rem .8rem; font-size: .88rem; }
+  .kv dt { color: var(--muted); } .kv dd { margin: 0; }
+  .spark h3, .card h3 { font-size: .8rem; color: var(--muted); font-weight: 600; margin: .6rem 0 .2rem; text-transform: uppercase; letter-spacing: .03em; }
+  .spark svg { width: 100%; height: 46px; display: block; }
+  .spark .lbl { display: flex; justify-content: space-between; font-size: .72rem; color: var(--muted); }
+  .chip { display: inline-block; padding: .1rem .5rem; border-radius: 999px; font-size: .8rem; font-weight: 600; margin-right: .3rem; }
+  .alert { border-left: 4px solid var(--alert); padding: .3rem .5rem; margin: .3rem 0; background: var(--bg); border-radius: 6px; font-size: .85rem; }
+  .alert b { display: block; }
+  .muted { color: var(--muted); font-size: .78rem; }
+  .list { display: flex; gap: .4rem; flex-wrap: wrap; margin-bottom: .6rem; }
+  .list button { font: inherit; color: var(--fg); background: var(--card); border: 1px solid var(--border); border-radius: 999px; padding: .3rem .7rem; cursor: pointer; }
+  .list button[aria-pressed="true"] { border-color: var(--accent); font-weight: 600; }
+  .leaflet-container { background: var(--card); }
+  .leaflet-div-icon { background: transparent; border: 0; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Weather DB</h1>
+  <nav><a href="./">History</a><a href="map.html" aria-current="page">Map</a></nav>
+  <div class="units" role="group" aria-label="Units"><button data-u="us">°F</button><button data-u="metric">°C</button></div>
+</header>
+<main>
+  <div id="status" class="status">Loading weather.db…</div>
+  <div class="layout">
+    <div id="map"></div>
+    <aside>
+      <div class="list" id="list"></div>
+      <div id="detail"></div>
+      <p class="muted">Pin ring color = SPC Day 1 convective risk · red badge = active NWS alerts.
+        Sources: Open-Meteo forecast, NWS (api.weather.gov), NOAA SPC. Map © OpenStreetMap contributors.</p>
+    </aside>
+  </div>
+</main>
+<script src="vendor/sql-wasm.js"></script>
+<script src="vendor/leaflet.js"></script>
+<script src="common.js"></script>
+<script src="map.js"></script>
+</body>
+</html>

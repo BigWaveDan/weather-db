@@ -166,6 +166,51 @@ These rules keep the committed DB small:
   Snapshots from the last 2 days are all kept.
 - **Afterwards:** `VACUUM` reclaims the space.
 
+## Website (static, zero-cost)
+
+**Live site:** https://bigwavedan.github.io/weather-db/ (it redirects to `web/`)
+- **History** (`web/index.html`): choose all locations or one, and a range
+  (the last 7/30/90/365 days of data, or a custom range). It charts
+  temperature, precipitation and wind (speed, with gusts dashed). Ranges up to
+  31 days are hourly; longer ones use complete local-day aggregates. There's a
+  °F/°C toggle, and it also switches wind to mph or km/h and precipitation to
+  in or mm. A "data through" note shows how current the history is.
+- **Map** (`web/map.html`): Leaflet with OSM tiles.
+  - **Pins:** each pin shows the current temperature and a condition icon.
+    Its ring color is the SPC Day 1 risk, and a red badge appears when NWS
+    alerts are active.
+  - **Detail card:** current conditions for the nearest forecast hour, 12-hour
+    temperature and precip-chance sparklines, active alerts, SPC Day 1/2
+    categories, and fetched-at times.
+
+**How it stays simple:**
+- No build step. Every library is **vendored** in `web/vendor/`: sql.js
+  1.15.2 (WASM), uPlot 1.6.32 and Leaflet 1.9.4, with their licenses.
+- Both pages download the **same** `data/weather.db` with sql.js and only
+  run simple `SELECT`s on views. The DB is fetched with `cache: "no-cache"`,
+  so the browser revalidates it with Pages' ETag and re-downloads only when a
+  push has changed it.
+- All the logic is in SQL or the fetcher:
+
+| object | written by | used by |
+|---|---|---|
+| `observations_daily` | `fetch.py derive` (runs at the end of `backfill` and `all`). It aggregates complete **local** days (23 or more hours) using each location's IANA zone, so DST is handled | History, long ranges |
+| `site_hourly_wide`, `site_daily_wide` | `init_db.py`, generated from `locations`. One row per timestamp and one column group per location | History charts |
+| `site_data_status` | `schema.sql` | History "data through" note |
+| `site_current_conditions` | `schema.sql`. Nearest hour from the latest Open-Meteo and NWS snapshots, the condition icon key (a CASE on the NWS shortForecast text), alert count, and SPC Day 1/2 risk with its color | Map pins and card |
+| `site_forecast_upcoming` | `schema.sql`. The latest snapshot from the current hour on, ranked | Map sparklines |
+| `site_active_alerts` | `schema.sql`. Alerts seen in the newest alerts fetch that haven't expired or ended | Map |
+| `site_spc_risk`, `spc_categories` | `schema.sql`. The latest Day 1/2 risk per location; colors match SPC's own fills | Map |
+
+Views that use `now` are evaluated by sql.js with the viewer's clock.
+`locations.map_label_side` keeps the Worthington and Brandon pins, about
+85 km apart, from overlapping.
+
+**Deploy:** GitHub Pages serves `main` from the repo root. `.nojekyll`
+serves files as they are. Run the fetcher, then commit and push, and the
+site updates. Preview locally with `python -m http.server` from the repo
+root, then open `/web/`.
+
 ## Schema (`schema.sql`)
 
 | table | purpose |
@@ -204,11 +249,8 @@ kept.
    backward 30 days per chunk, paced and resumable. The first slice covers
    2025-11-06 to 2026-10-31 for all 3 locations. `fetch.py prune` keeps the
    DB small.
-4. **Website** (static, reads `data/weather.db`):
-   - *Historical page*: charts of temperature, precipitation and wind over
-     time, filterable by location.
-   - *Map page*: pins at the three locations showing current conditions and
-     active alerts.
+4. ✅ **Website**: a static two-page site, History and Map, that reads
+   `data/weather.db` with sql.js. It's deployed on GitHub Pages.
 5. Scheduled runs and daily fetch logs.
 
 Weather data comes from Open-Meteo (open-meteo.com) (CC BY 4.0), NOAA/NWS, and NOAA/SPC.

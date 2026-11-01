@@ -13,6 +13,7 @@ MIGRATIONS = {
     "observations_hourly": [("relative_humidity_pct", "REAL"), ("pressure_msl_hpa", "REAL")],
     "backfill_progress": [("chunks_fetched", "INTEGER NOT NULL DEFAULT 0"), ("last_error", "TEXT")],
     "raw_responses": [("body_pruned_at", "TEXT")],
+    "locations": [("map_label_side", "TEXT NOT NULL DEFAULT 'center'")],
 }
 
 
@@ -26,8 +27,31 @@ def init_db(db_path=DB_PATH):
                 if name not in have:
                     con.execute(f"ALTER TABLE {table} ADD COLUMN {name} {typ}")
     con.executescript((ROOT / "schema.sql").read_text())
+    create_wide_views(con)
     con.commit()
     return con
+
+
+def create_wide_views(con):
+    """Pivot views for the site's charts: one row per timestamp, one column group per location
+    (columns named <slug with _>_<metric>), so the frontend never has to join or align series.
+    Regenerated from the locations table every time init_db runs."""
+    locs = con.execute("SELECT id, slug FROM locations ORDER BY id").fetchall()
+    hourly, daily = [], []
+    for lid, slug in locs:
+        k = slug.replace("-", "_")
+        for col, name in [("temperature_c", "temp_c"), ("precip_mm", "precip_mm"),
+                          ("wind_speed_kmh", "wind_kmh"), ("wind_gust_kmh", "gust_kmh")]:
+            hourly.append(f"MAX(CASE WHEN location_id={lid} THEN {col} END) AS {k}_{name}")
+        for col in ["temp_min_c", "temp_max_c", "temp_avg_c", "precip_mm", "wind_avg_kmh",
+                    "wind_max_kmh", "gust_max_kmh"]:
+            daily.append(f"MAX(CASE WHEN location_id={lid} THEN {col} END) AS {k}_{col}")
+    con.execute("DROP VIEW IF EXISTS site_hourly_wide")
+    con.execute("CREATE VIEW site_hourly_wide AS SELECT time, CAST(strftime('%s', time) AS INTEGER) AS epoch, "
+                + ", ".join(hourly) + " FROM observations_hourly GROUP BY time")
+    con.execute("DROP VIEW IF EXISTS site_daily_wide")
+    con.execute("CREATE VIEW site_daily_wide AS SELECT date, CAST(strftime('%s', date || 'T12:00:00Z') AS INTEGER) AS epoch, "
+                + ", ".join(daily) + " FROM observations_daily GROUP BY date")
 
 
 if __name__ == "__main__":

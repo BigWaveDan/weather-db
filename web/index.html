@@ -1,0 +1,49 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Weather DB · History</title>
+<link rel="stylesheet" href="vendor/uPlot.min.css">
+<link rel="stylesheet" href="common.css">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22%3E%3Ctext y=%22.9em%22 font-size=%2290%22%3E%E2%9B%85%3C/text%3E%3C/svg%3E">
+</head>
+<body>
+<header>
+  <h1>Weather DB</h1>
+  <nav><a href="./" aria-current="page">History</a><a href="map.html">Map</a></nav>
+  <div class="units" role="group" aria-label="Units"><button data-u="us">°F</button><button data-u="metric">°C</button></div>
+</header>
+<main>
+  <div class="controls">
+    <label>Location
+      <select id="loc"><option value="all">All locations</option></select>
+    </label>
+    <label>Range
+      <select id="range">
+        <option value="7">Last 7 days</option>
+        <option value="30" selected>Last 30 days</option>
+        <option value="90">Last 90 days</option>
+        <option value="365">Last 365 days</option>
+        <option value="custom">Custom…</option>
+      </select>
+    </label>
+    <div class="custom" id="custom">
+      <label>From <input type="date" id="from"></label>
+      <label>To <input type="date" id="to"></label>
+      <button id="apply" type="button">Apply</button>
+    </div>
+  </div>
+  <p class="note" id="note"></p>
+  <div id="status" class="status">Loading weather.db…</div>
+  <section class="chart" id="c-temp" hidden><h2>Temperature <small id="h-temp"></small></h2><div class="plot"></div></section>
+  <section class="chart" id="c-precip" hidden><h2>Precipitation <small id="h-precip"></small></h2><div class="plot"></div></section>
+  <section class="chart" id="c-wind" hidden><h2>Wind <small id="h-wind"></small></h2><div class="plot"></div></section>
+  <p class="note">Data: Open-Meteo Historical Weather API (ERA5 reanalysis, CC BY 4.0). Grid-cell values (~25 km), not station readings.</p>
+</main>
+<script src="vendor/sql-wasm.js"></script>
+<script src="vendor/uPlot.iife.min.js"></script>
+<script src="common.js"></script>
+<script src="history.js"></script>
+</body>
+</html>
